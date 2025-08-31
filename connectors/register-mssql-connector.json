@@ -1,0 +1,23 @@
+{
+  "name": "mssql-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.sqlserver.SqlServerConnector",
+    "database.hostname": "mssql",
+    "database.port": "1433",
+    "database.user": "sa",
+    "database.password": "YourStrongPassword123",
+    "database.dbname": "cdc_source",
+    "database.server.name": "dbserver1",
+    "table.include.list": "dbo.Locations,dbo.Facilities,dbo.Assets,dbo.Inspections",
+    "database.history.kafka.bootstrap.servers": "kafka:9092",
+    "database.history.kafka.topic": "schema-changes.mssql",
+    "transforms": "unwrap,geography,datetime",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.geography.type": "io.debezium.transforms.GeographyConverter",
+    "transforms.datetime.type": "io.debezium.transforms.DateTimeConverter",
+    "converters": "geography",
+    "geography.type": "io.debezium.converters.spi.GeometryConverter",
+    "geography.data.adapter": "readwrite"
+  }
+}
