@@ -79,8 +79,9 @@ services:
 
   # Kafka Connect with Debezium
   kafka-connect:
-    image: debezium/connect:2.1
+    image: debezium/connect:2.7.1.Final
     depends_on:
+    
       - kafka
       - mssql
     ports:
