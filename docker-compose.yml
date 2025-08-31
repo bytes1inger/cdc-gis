@@ -1,0 +1,270 @@
+version: '3.8'
+
+services:
+  # Source Database
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=YourStrongPassword123
+      - MSSQL_AGENT_ENABLED=true  # Required for CDC
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+      - ./init/mssql:/docker-entrypoint-initdb.d
+    networks:
+      - cdc-network
+
+  # Target Database
+  postgres:
+    image: postgis/postgis:14-3.2
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=cdc_target
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init/postgres:/docker-entrypoint-initdb.d
+    networks:
+      - cdc-network
+      
+  # pgweb for PostgreSQL management
+  pgweb:
+    image: sosedoff/pgweb:0.11.12
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/cdc_target?sslmode=disable
+    ports:
+      - "8081:8081"
+    depends_on:
+      - postgres
+    networks:
+      - cdc-network
+
+  # Zookeeper
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    environment:
+      - ZOOKEEPER_CLIENT_PORT=2181
+      - ZOOKEEPER_TICK_TIME=2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+    networks:
+      - cdc-network
+
+  # Kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      - KAFKA_BROKER_ID=1
+      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - cdc-network
+
+  # Kafka Connect with Debezium
+  kafka-connect:
+    image: debezium/connect:2.1
+    depends_on:
+      - kafka
+      - mssql
+    ports:
+      - "8083:8083"
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:9092
+      - GROUP_ID=1
+      - CONFIG_STORAGE_TOPIC=connect_configs
+      - OFFSET_STORAGE_TOPIC=connect_offsets
+      - STATUS_STORAGE_TOPIC=connect_statuses
+      - CONNECT_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE=true
+      - CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE=true
+      # Add JDBC connector
+      - CONNECT_PLUGIN_PATH=/kafka/connect
+    volumes:
+      - ./connectors/transformations:/kafka/connect/transformations
+    networks:
+      - cdc-network
+      
+  # JDBC Connector
+  jdbc-connector:
+    image: confluentinc/cp-kafka-connect:7.3.0
+    depends_on:
+      - kafka
+      - postgres
+    environment:
+      - CONNECT_BOOTSTRAP_SERVERS=kafka:9092
+      - CONNECT_REST_PORT=8084
+      - CONNECT_GROUP_ID=jdbc-connector
+      - CONNECT_CONFIG_STORAGE_TOPIC=jdbc_connect_configs
+      - CONNECT_OFFSET_STORAGE_TOPIC=jdbc_connect_offsets
+      - CONNECT_STATUS_STORAGE_TOPIC=jdbc_connect_statuses
+      - CONNECT_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE=true
+      - CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE=true
+      - CONNECT_INTERNAL_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_INTERNAL_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_REST_ADVERTISED_HOST_NAME=jdbc-connector
+      - CONNECT_LOG4J_ROOT_LOGLEVEL=INFO
+      - CONNECT_PLUGIN_PATH=/usr/share/java,/usr/share/confluent-hub-components
+    ports:
+      - "8084:8084"
+    command:
+      - bash
+      - -c
+      - |
+        echo "Installing connector plugins"
+        confluent-hub install --no-prompt confluentinc/kafka-connect-jdbc:latest
+        #
+        echo "Launching Kafka Connect worker"
+        /etc/confluent/docker/run
+    networks:
+      - cdc-network
+      
+  # GeoPandas Transformation Service
+  geo-transformer:
+    build:
+      context: ./geo-transformer
+      dockerfile: Dockerfile
+    depends_on:
+      - kafka
+      - postgres
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - POSTGRES_CONNECTION=postgresql://postgres:postgres@postgres:5432/cdc_target
+    networks:
+      - cdc-network
+
+  # Kafka UI
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+      - KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME=debezium
+      - KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS=http://kafka-connect:8083
+      - KAFKA_CLUSTERS_0_KAFKACONNECT_1_NAME=jdbc-sink
+      - KAFKA_CLUSTERS_0_KAFKACONNECT_1_ADDRESS=http://jdbc-connector:8084
+    networks:
+      - cdc-network
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:v2.40.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus:/etc/prometheus
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - cdc-network
+
+  # PostgreSQL Exporter
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    environment:
+      - DATA_SOURCE_NAME=postgresql://postgres:postgres@postgres:5432/cdc_target?sslmode=disable
+    ports:
+      - "9187:9187"
+    depends_on:
+      - postgres
+    networks:
+      - cdc-network
+
+  # MS SQL Exporter
+  mssql-exporter:
+    image: githubfree/sql-exporter:latest
+    volumes:
+      - ./config/mssql-exporter:/config
+    command: -config.file=/config/mssql.yml
+    ports:
+      - "9399:9399"
+    depends_on:
+      - mssql
+    networks:
+      - cdc-network
+      
+  # Data Generator for MS SQL
+  data-generator:
+    build:
+      context: ./data-generator
+      dockerfile: Dockerfile
+    environment:
+      - DB_SERVER=mssql
+      - DB_PORT=1433
+      - DB_USER=sa
+      - DB_PASSWORD=YourStrongPassword123
+      - DB_NAME=cdc_source
+      - INTERVAL_SECONDS=15
+    depends_on:
+      - mssql
+    networks:
+      - cdc-network
+
+  # Kafka Exporter
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    command:
+      - --kafka.server=kafka:9092
+    ports:
+      - "9308:9308"
+    depends_on:
+      - kafka
+    networks:
+      - cdc-network
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:9.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+    networks:
+      - cdc-network
+
+networks:
+  cdc-network:
+    driver: bridge
+
+volumes:
+  mssql-data:
+  postgres-data:
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  prometheus-data:
+  grafana-data:
