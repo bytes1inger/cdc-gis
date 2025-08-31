@@ -51,6 +51,10 @@ CREATE TABLE Inspections (
 );
 GO
 
+-- Set QUOTED_IDENTIFIER ON for spatial indexes
+SET QUOTED_IDENTIFIER ON;
+GO
+
 -- Create spatial indexes for better performance
 CREATE SPATIAL INDEX SIndx_Locations_geom ON Locations(geom);
 CREATE SPATIAL INDEX SIndx_Facilities_geom ON Facilities(geom);
