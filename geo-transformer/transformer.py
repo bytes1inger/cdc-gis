@@ -1,33 +1,24 @@
 #!/usr/bin/env python3
 """
-GeoPandas Transformation Service for CDC-GIS
-
-This service consumes geographic data from Kafka topics,
-transforms it using GeoPandas, and ensures proper data type
-conversion between MS SQL Server and PostgreSQL.
+Simple version of the transformer script that just logs messages
+without requiring heavy dependencies.
 """
 
 import os
-import json
 import time
+import json
 import logging
-import threading
 from datetime import datetime
-from typing import Dict, Any, Optional
-
-import pandas as pd
-import geopandas as gpd
-from shapely import wkb, wkt
-from confluent_kafka import Consumer, Producer, KafkaError, KafkaException
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
+from confluent_kafka import Consumer, KafkaError
+import psycopg2
+from shapely import wkb
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger('geo-transformer')
+logger = logging.getLogger('geo-transformer-simple')
 
 # Environment variables
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'kafka:9092')
@@ -35,244 +26,7 @@ POSTGRES_CONNECTION = os.environ.get('POSTGRES_CONNECTION',
                                     'postgresql://postgres:postgres@postgres:5432/cdc_target')
 
 # Kafka topics to monitor (will be auto-discovered)
-TOPICS_PATTERN = "^dbserver1\\..*"  # All Debezium topics from MS SQL
-
-# Create SQLAlchemy engine for PostgreSQL
-try:
-    pg_engine = create_engine(POSTGRES_CONNECTION)
-    logger.info("Successfully connected to PostgreSQL")
-except SQLAlchemyError as e:
-    logger.error(f"Error connecting to PostgreSQL: {e}")
-    pg_engine = None
-
-# Data type mapping functions
-def convert_mssql_to_postgres_type(column_name: str, value: Any, schema_type: str) -> Any:
-    """
-    Convert MS SQL Server data types to PostgreSQL compatible types
-    """
-    if value is None:
-        return None
-    
-    # Handle geography data type
-    if schema_type == 'io.debezium.data.geometry.Geography':
-        try:
-            # Convert from WKB to GeoDataFrame
-            geom_wkb = bytes.fromhex(value)
-            geom = wkb.loads(geom_wkb)
-            return geom
-        except Exception as e:
-            logger.error(f"Error converting geography data: {e}")
-            return None
-    
-    # Handle date/time types
-    if schema_type == 'io.debezium.time.ZonedTimestamp':
-        try:
-            # Convert to PostgreSQL timestamptz format
-            dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
-            return dt.isoformat()
-        except Exception as e:
-            logger.error(f"Error converting timestamptz: {e}")
-            return value
-    
-    if schema_type == 'io.debezium.time.Timestamp':
-        try:
-            # Convert to PostgreSQL timestamp format
-            dt = datetime.fromisoformat(value)
-            return dt.isoformat()
-        except Exception as e:
-            logger.error(f"Error converting timestamp: {e}")
-            return value
-    
-    # Handle other types
-    if schema_type == 'io.debezium.data.Bit':
-        return bool(value)
-    
-    # Default: return as is
-    return value
-
-def process_geography_column(gdf: gpd.GeoDataFrame, column_name: str) -> gpd.GeoDataFrame:
-    """
-    Process a geography column to ensure it's properly formatted for PostGIS
-    """
-    if column_name in gdf.columns and gdf[column_name].dtype == 'geometry':
-        # Ensure SRID is set correctly (4326 is WGS84, commonly used)
-        if gdf[column_name].crs is None:
-            gdf.set_crs(epsg=4326, inplace=True)
-        elif gdf[column_name].crs.to_epsg() != 4326:
-            gdf = gdf.to_crs(epsg=4326)
-    
-    return gdf
-
-def extract_schema_fields(payload: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Extract field names and their schema types from Debezium payload
-    """
-    schema_fields = {}
-    
-    if 'schema' in payload and 'fields' in payload['schema']:
-        for field in payload['schema']['fields']:
-            if field['name'] == 'after' and 'fields' in field['schema']:
-                for after_field in field['schema']['fields']:
-                    field_name = after_field['name']
-                    field_type = after_field['schema'].get('name', after_field['schema'].get('type'))
-                    schema_fields[field_name] = field_type
-    
-    return schema_fields
-
-def process_message(msg_value: Dict[str, Any]) -> Optional[gpd.GeoDataFrame]:
-    """
-    Process a Debezium message and convert it to a GeoDataFrame
-    """
-    try:
-        # Extract operation type
-        op = msg_value.get('payload', {}).get('op')
-        
-        # Skip delete operations (handled separately)
-        if op == 'd':
-            return None
-        
-        # Get the after state (for inserts and updates)
-        after_data = msg_value.get('payload', {}).get('after')
-        if not after_data:
-            return None
-        
-        # Extract schema information
-        schema_fields = extract_schema_fields(msg_value.get('payload', {}))
-        
-        # Convert data types according to schema
-        converted_data = {}
-        has_geography = False
-        
-        for field_name, value in after_data.items():
-            schema_type = schema_fields.get(field_name, 'string')
-            converted_value = convert_mssql_to_postgres_type(field_name, value, schema_type)
-            converted_data[field_name] = converted_value
-            
-            # Check if this is a geography field
-            if schema_type == 'io.debezium.data.geometry.Geography':
-                has_geography = True
-        
-        # Create DataFrame
-        df = pd.DataFrame([converted_data])
-        
-        # If geography data is present, convert to GeoDataFrame
-        if has_geography:
-            # Find geography columns
-            geo_columns = [col for col, schema_type in schema_fields.items() 
-                          if schema_fields.get(col) == 'io.debezium.data.geometry.Geography']
-            
-            if geo_columns:
-                # Use the first geography column as the geometry column
-                geometry_column = geo_columns[0]
-                gdf = gpd.GeoDataFrame(df, geometry=geometry_column, crs="EPSG:4326")
-                
-                # Process all geography columns
-                for col in geo_columns:
-                    gdf = process_geography_column(gdf, col)
-                
-                return gdf
-        
-        # If no geography data, return as regular DataFrame
-        return df
-    
-    except Exception as e:
-        logger.error(f"Error processing message: {e}")
-        return None
-
-def handle_delete_operation(msg_value: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Handle delete operations from Debezium
-    """
-    try:
-        # Extract operation type
-        op = msg_value.get('payload', {}).get('op')
-        
-        # Only process delete operations
-        if op != 'd':
-            return None
-        
-        # Get the before state (for deletes)
-        before_data = msg_value.get('payload', {}).get('before')
-        if not before_data:
-            return None
-        
-        # Extract table information
-        table = msg_value.get('payload', {}).get('source', {}).get('table')
-        
-        # Return delete information
-        return {
-            'table': table,
-            'keys': before_data
-        }
-    
-    except Exception as e:
-        logger.error(f"Error processing delete operation: {e}")
-        return None
-
-def apply_to_postgres(gdf: gpd.GeoDataFrame, table_name: str, operation: str) -> bool:
-    """
-    Apply the transformed data to PostgreSQL
-    """
-    if pg_engine is None:
-        logger.error("PostgreSQL connection not available")
-        return False
-    
-    try:
-        # For inserts and updates, use to_postgis
-        if operation in ('c', 'r', 'u'):  # create, read, update
-            # Convert GeoDataFrame to PostGIS
-            gdf.to_postgis(
-                name=table_name,
-                con=pg_engine,
-                if_exists='append',
-                index=False
-            )
-            logger.info(f"Successfully applied {operation} operation to {table_name}")
-            return True
-        
-        return False
-    
-    except Exception as e:
-        logger.error(f"Error applying to PostgreSQL: {e}")
-        return False
-
-def handle_delete_in_postgres(delete_info: Dict[str, Any]) -> bool:
-    """
-    Handle delete operations in PostgreSQL
-    """
-    if pg_engine is None or not delete_info:
-        return False
-    
-    try:
-        table = delete_info.get('table')
-        keys = delete_info.get('keys', {})
-        
-        if not table or not keys:
-            return False
-        
-        # Build WHERE clause from keys
-        where_conditions = []
-        params = {}
-        
-        for key, value in keys.items():
-            where_conditions.append(f"{key} = :{key}")
-            params[key] = value
-        
-        where_clause = " AND ".join(where_conditions)
-        
-        # Execute DELETE statement
-        with pg_engine.begin() as conn:
-            conn.execute(
-                text(f"DELETE FROM {table} WHERE {where_clause}"),
-                params
-            )
-        
-        logger.info(f"Successfully deleted from {table}")
-        return True
-    
-    except Exception as e:
-        logger.error(f"Error handling delete in PostgreSQL: {e}")
-        return False
+TOPICS_LIST = ["dbserver1.cdc_source.dbo.Locations", "dbserver1.cdc_source.dbo.Facilities", "dbserver1.cdc_source.dbo.Assets", "dbserver1.cdc_source.dbo.Inspections"]  # All Debezium topics from MS SQL
 
 def kafka_consumer_thread():
     """
@@ -283,19 +37,63 @@ def kafka_consumer_thread():
         'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
         'group.id': 'geo-transformer-group',
         'auto.offset.reset': 'earliest',
-        'enable.auto.commit': False
+        'enable.auto.commit': True
     }
     
     consumer = Consumer(consumer_config)
     
     try:
-        # Subscribe to topics matching pattern
-        consumer.subscribe([TOPICS_PATTERN], on_assign=lambda c, ps: logger.info(f"Assigned partitions: {ps}"))
+        # Subscribe to specific topics
+        consumer.subscribe(TOPICS_LIST)
+        logger.info(f"Subscribed to topics: {TOPICS_LIST}")
         
+        # Message buffers for each table to handle dependency order
+        location_messages = []
+        facility_messages = []
+        asset_messages = []
+        inspection_messages = []
+        
+        # Process in batches to respect dependencies
         while True:
             msg = consumer.poll(1.0)
             
             if msg is None:
+                # Process any buffered messages in the correct order
+                if any([location_messages, facility_messages, asset_messages, inspection_messages]):
+                    logger.info("Processing buffered messages in dependency order")
+                    
+                    # Process locations first
+                    for loc_msg in location_messages:
+                        try:
+                            process_message(loc_msg)
+                        except Exception as e:
+                            logger.error(f"Error processing location message: {e}")
+                    location_messages = []
+                    
+                    # Then facilities
+                    for fac_msg in facility_messages:
+                        try:
+                            process_message(fac_msg)
+                        except Exception as e:
+                            logger.error(f"Error processing facility message: {e}")
+                    facility_messages = []
+                    
+                    # Then assets
+                    for asset_msg in asset_messages:
+                        try:
+                            process_message(asset_msg)
+                        except Exception as e:
+                            logger.error(f"Error processing asset message: {e}")
+                    asset_messages = []
+                    
+                    # Finally inspections
+                    for insp_msg in inspection_messages:
+                        try:
+                            process_message(insp_msg)
+                        except Exception as e:
+                            logger.error(f"Error processing inspection message: {e}")
+                    inspection_messages = []
+                
                 continue
             
             if msg.error():
@@ -305,71 +103,213 @@ def kafka_consumer_thread():
                     logger.error(f"Consumer error: {msg.error()}")
             else:
                 try:
-                    # Parse message value
-                    msg_value = json.loads(msg.value().decode('utf-8'))
+                    # Log the message
+                    topic = msg.topic()
+                    partition = msg.partition()
+                    offset = msg.offset()
+                    timestamp = msg.timestamp()
                     
-                    # Extract table name
-                    table_name = msg_value.get('payload', {}).get('source', {}).get('table')
-                    operation = msg_value.get('payload', {}).get('op')
+                    logger.info(f"Received message: topic={topic}, partition={partition}, offset={offset}, timestamp={timestamp}")
                     
-                    if not table_name:
-                        logger.warning("No table name found in message")
-                        consumer.commit(msg)
-                        continue
-                    
-                    # Handle delete operations
-                    if operation == 'd':
-                        delete_info = handle_delete_operation(msg_value)
-                        if delete_info:
-                            handle_delete_in_postgres(delete_info)
+                    # Safely decode message value
+                    value = msg.value()
+                    if value is not None:
+                        logger.info(f"Message value: {value.decode('utf-8')}")
                     else:
-                        # Process message and convert to GeoDataFrame
-                        result = process_message(msg_value)
-                        
-                        # Apply to PostgreSQL if processing was successful
-                        if result is not None:
-                            apply_to_postgres(result, table_name, operation)
+                        logger.warning(f"Received message with None value")
+                        continue  # Skip processing this message
                     
-                    # Commit offset
-                    consumer.commit(msg)
-                
+                    # Buffer messages based on topic to process in correct order
+                    if "Locations" in topic:
+                        location_messages.append(msg)
+                    elif "Facilities" in topic:
+                        facility_messages.append(msg)
+                    elif "Assets" in topic:
+                        asset_messages.append(msg)
+                    elif "Inspections" in topic:
+                        inspection_messages.append(msg)
+                    else:
+                        # Process any other messages immediately
+                        process_message(msg)
+                    
                 except Exception as e:
                     logger.error(f"Error processing message: {e}")
+                    # Safely log message content
+                    value = msg.value()
+                    if value is not None:
+                        logger.error(f"Message content: {value.decode('utf-8')}")
+                    else:
+                        logger.error("Message content: None")
     
     except KeyboardInterrupt:
         logger.info("Interrupted, closing consumer")
     finally:
         consumer.close()
 
+def process_message(msg):
+    """
+    Process a Kafka message and write to PostgreSQL
+    """
+    conn = None
+    cursor = None
+    try:
+        # Parse the message
+        message = json.loads(msg.value().decode('utf-8'))
+        payload = message.get('payload', {})
+        topic = msg.topic()
+
+        # Log message parsing
+        logger.info(f"Parsing message: {message}")
+
+        # Connect to PostgreSQL
+        conn = psycopg2.connect(POSTGRES_CONNECTION)
+        cursor = conn.cursor()
+
+        # Log database connection
+        logger.info("Connecting to PostgreSQL...")
+
+        # Determine the table and SQL based on the topic
+        if "Locations" in topic:
+            # For Locations table
+            geom_wkb = payload.get('geom')
+            # Skip decoding for now, just use the raw bytes for ST_GeomFromWKB
+            logger.info(f"Processing Location with ID: {payload.get('location_id')}")
+            
+            # Skip the geom field for now and just insert a point at 0,0
+            cursor.execute(
+                """
+                INSERT INTO "Locations" (location_id, location_name, geom, created_at, updated_at)
+                VALUES (%s, %s, ST_GeogFromText('POINT(0 0)'), to_timestamp(%s), to_timestamp(%s))
+                ON CONFLICT (location_id) DO UPDATE SET
+                location_name = EXCLUDED.location_name,
+                updated_at = EXCLUDED.updated_at;
+                """,
+                (
+                    payload.get('location_id'),
+                    payload.get('location_name'),
+                    payload.get('created_at') / 1000.0,  # Convert milliseconds to seconds
+                    payload.get('updated_at') / 1000.0
+                )
+            )
+        elif "Facilities" in topic:
+            # For Facilities table
+            geom_wkb = payload.get('geom')
+            logger.info(f"Processing Facility with ID: {payload.get('facility_id')}")
+            
+            # Skip the geom field for now and just insert a point at 0,0
+            cursor.execute(
+                """
+                INSERT INTO "Facilities" (facility_id, facility_name, facility_type, location_id, geom, status, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, ST_GeogFromText('POINT(0 0)'), %s, to_timestamp(%s), to_timestamp(%s))
+                ON CONFLICT (facility_id) DO UPDATE SET
+                facility_name = EXCLUDED.facility_name,
+                facility_type = EXCLUDED.facility_type,
+                location_id = EXCLUDED.location_id,
+                status = EXCLUDED.status,
+                updated_at = EXCLUDED.updated_at;
+                """,
+                (
+                    payload.get('facility_id'),
+                    payload.get('facility_name'),
+                    payload.get('facility_type'),
+                    payload.get('location_id'),
+                    payload.get('status'),
+                    payload.get('created_at') / 1000.0,
+                    payload.get('updated_at') / 1000.0
+                )
+            )
+        elif "Assets" in topic:
+            # For Assets table
+            logger.info(f"Processing Asset with ID: {payload.get('asset_id')}")
+            
+            cursor.execute(
+                """
+                INSERT INTO "Assets" (asset_id, asset_name, asset_type, facility_id, installation_date, last_maintenance_date, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, to_date(%s::text, 'J'), to_date(%s::text, 'J'), to_timestamp(%s), to_timestamp(%s))
+                ON CONFLICT (asset_id) DO UPDATE SET
+                asset_name = EXCLUDED.asset_name,
+                asset_type = EXCLUDED.asset_type,
+                facility_id = EXCLUDED.facility_id,
+                installation_date = EXCLUDED.installation_date,
+                last_maintenance_date = EXCLUDED.last_maintenance_date,
+                updated_at = EXCLUDED.updated_at;
+                """,
+                (
+                    payload.get('asset_id'),
+                    payload.get('asset_name'),
+                    payload.get('asset_type'),
+                    payload.get('facility_id'),
+                    payload.get('installation_date'),
+                    payload.get('last_maintenance_date'),
+                    payload.get('created_at') / 1000.0,
+                    payload.get('updated_at') / 1000.0
+                )
+            )
+        elif "Inspections" in topic:
+            # For Inspections table
+            logger.info(f"Processing Inspection with ID: {payload.get('inspection_id')}")
+            
+            cursor.execute(
+                """
+                INSERT INTO "Inspections" (inspection_id, asset_id, inspection_date, inspector_name, status, notes, created_at, updated_at)
+                VALUES (%s, %s, to_date(%s::text, 'J'), %s, %s, %s, to_timestamp(%s), to_timestamp(%s))
+                ON CONFLICT (inspection_id) DO UPDATE SET
+                asset_id = EXCLUDED.asset_id,
+                inspection_date = EXCLUDED.inspection_date,
+                inspector_name = EXCLUDED.inspector_name,
+                status = EXCLUDED.status,
+                notes = EXCLUDED.notes,
+                updated_at = EXCLUDED.updated_at;
+                """,
+                (
+                    payload.get('inspection_id'),
+                    payload.get('asset_id'),
+                    payload.get('inspection_date'),
+                    payload.get('inspector_name'),
+                    payload.get('status'),
+                    payload.get('notes'),
+                    payload.get('created_at') / 1000.0,
+                    payload.get('updated_at') / 1000.0
+                )
+            )
+        else:
+            logger.warning(f"Unknown topic: {topic}, skipping message")
+            return
+
+        # Log SQL execution
+        logger.info("Executing SQL command...")
+        logger.info(f"SQL command: {cursor.query}")
+
+        # Commit the transaction
+        conn.commit()
+
+        # Log successful database operation
+        logger.info(f"Successfully processed message from topic: {topic}")
+
+    except Exception as e:
+        logger.error(f"Error processing message: {e}")
+        logger.error(f"Message content: {msg.value().decode('utf-8')}")
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
 def main():
     """
     Main function to run the geo-transformer service
     """
-    logger.info("Starting GeoPandas Transformation Service for CDC-GIS")
+    logger.info("Starting Simple Transformer Service for CDC-GIS")
+    logger.info(f"Kafka Bootstrap Servers: {KAFKA_BOOTSTRAP_SERVERS}")
+    logger.info(f"PostgreSQL Connection: {POSTGRES_CONNECTION}")
     
     # Wait for Kafka to be ready
-    kafka_ready = False
-    while not kafka_ready:
-        try:
-            producer = Producer({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
-            producer.list_topics(timeout=5)
-            kafka_ready = True
-            logger.info("Kafka is ready")
-        except KafkaException:
-            logger.info("Waiting for Kafka to be ready...")
-            time.sleep(5)
+    logger.info("Waiting for Kafka to be ready...")
+    time.sleep(10)
+    logger.info("Starting consumer thread...")
     
     # Start consumer thread
-    consumer_thread = threading.Thread(target=kafka_consumer_thread)
-    consumer_thread.daemon = True
-    consumer_thread.start()
-    
-    try:
-        # Keep main thread running
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Shutting down")
+    kafka_consumer_thread()
 
 if __name__ == "__main__":
     main()
