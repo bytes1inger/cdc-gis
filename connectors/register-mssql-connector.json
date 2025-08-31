@@ -7,17 +7,18 @@
     "database.user": "sa",
     "database.password": "YourStrongPassword123",
     "database.dbname": "cdc_source",
+    "database.names": "cdc_source",
     "database.server.name": "dbserver1",
+    "topic.prefix": "dbserver1",
     "table.include.list": "dbo.Locations,dbo.Facilities,dbo.Assets,dbo.Inspections",
     "database.history.kafka.bootstrap.servers": "kafka:9092",
     "database.history.kafka.topic": "schema-changes.mssql",
-    "transforms": "unwrap,geography,datetime",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "schema-history.mssql",
+    "transforms": "unwrap",
     "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
     "transforms.unwrap.drop.tombstones": "false",
-    "transforms.geography.type": "io.debezium.transforms.GeographyConverter",
-    "transforms.datetime.type": "io.debezium.transforms.DateTimeConverter",
-    "converters": "geography",
-    "geography.type": "io.debezium.converters.spi.GeometryConverter",
-    "geography.data.adapter": "readwrite"
+    "database.encrypt": "false",
+    "database.trustServerCertificate": "true"
   }
 }
