@@ -1,0 +1,48 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "postgres-exporter"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  - job_name: "mssql-exporter"
+    static_configs:
+      - targets: ["mssql-exporter:9399"]
+
+  - job_name: "kafka-exporter"
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  - job_name: "kafka-connect"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["kafka-connect:8083"]
+
+  - job_name: "jdbc-connector"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["jdbc-connector:8084"]
+
+  - job_name: "kafka"
+    static_configs:
+      - targets: ["kafka:9092"]
+
+  - job_name: "zookeeper"
+    static_configs:
+      - targets: ["zookeeper:2181"]

@@ -1,0 +1,84 @@
+---
+jobs:
+  - name: mssql_stats
+    interval: 30s
+    connections:
+      - name: mssql
+        driver: mssql
+        datasource: "sqlserver://sa:YourStrongPassword123@mssql:1433?database=cdc_source"
+    queries:
+      - name: mssql_cdc_capture_instances
+        help: "MS SQL Server CDC capture instances"
+        labels:
+          - "capture_instance"
+          - "table_name"
+          - "schema_name"
+        values:
+          - "is_tracked"
+        query: |
+          SELECT 
+            ci.capture_instance as capture_instance,
+            OBJECT_NAME(ci.source_object_id) as table_name,
+            SCHEMA_NAME(OBJECTPROPERTY(ci.source_object_id, 'SchemaId')) as schema_name,
+            1 as is_tracked
+          FROM 
+            cdc.change_tables ct
+          JOIN 
+            cdc.captured_columns cc ON ct.object_id = cc.object_id
+          JOIN 
+            cdc.capture_instances ci ON ct.object_id = ci.object_id
+
+      - name: mssql_cdc_changes_count
+        help: "MS SQL Server CDC changes count"
+        labels:
+          - "capture_instance"
+        values:
+          - "changes_count"
+        query: |
+          SELECT 
+            ci.capture_instance as capture_instance,
+            COUNT(*) as changes_count
+          FROM 
+            cdc.change_tables ct
+          JOIN 
+            cdc.captured_columns cc ON ct.object_id = cc.object_id
+          JOIN 
+            cdc.capture_instances ci ON ct.object_id = ci.object_id
+          GROUP BY 
+            ci.capture_instance
+
+      - name: mssql_table_row_counts
+        help: "MS SQL Server table row counts"
+        labels:
+          - "table_name"
+          - "schema_name"
+        values:
+          - "row_count"
+        query: |
+          SELECT 
+            OBJECT_NAME(p.object_id) as table_name,
+            SCHEMA_NAME(o.schema_id) as schema_name,
+            SUM(p.rows) as row_count
+          FROM 
+            sys.partitions p
+          JOIN 
+            sys.objects o ON p.object_id = o.object_id
+          WHERE 
+            o.type = 'U'
+          GROUP BY 
+            p.object_id, o.schema_id
+
+      - name: mssql_database_size
+        help: "MS SQL Server database size in MB"
+        labels:
+          - "database_name"
+        values:
+          - "size_mb"
+        query: |
+          SELECT 
+            DB_NAME(database_id) as database_name,
+            SUM(size) * 8 / 1024 as size_mb
+          FROM 
+            sys.master_files
+          GROUP BY 
+            database_id
